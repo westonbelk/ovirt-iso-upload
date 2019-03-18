@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+
+import ovirtsdk4 as sdk
+import getpass
+import logging
+import sys
+import math
+import json
+import subprocess
+import os
+import time
+
+import ssl
+from six.moves.http_client import HTTPSConnection
+from six.moves.urllib.parse import urlparse
+
+BUF_SIZE = 128 * 1024
+
+def convert_size(size_bytes):
+   if size_bytes == 0:
+       return "0B"
+   size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+   i = int(math.floor(math.log(size_bytes, 1024)))
+   p = math.pow(1024, i)
+   s = round(size_bytes / p, 2)
+   return "%s %s" % (s, size_name[i])
+
+def prepare_verify_iso(iso_path):
+    content_type = None
+    disk_info = json.loads(subprocess.check_output(["qemu-img", "info", "--output", "json", iso_path]))
+    if disk_info["format"] == "raw":
+        with open(iso_path, "rb") as f:
+            f.seek(0x8000)
+            primary_volume_descriptor = f.read(8)
+            if primary_volume_descriptor == b"\x01CD001\x01\x00":
+                content_type = sdk.types.DiskContentType.ISO
+    else:
+        raise RuntimeError(f'Unsupported iso format {disk_info["format"]}')
+    
+    if content_type != sdk.types.DiskContentType.ISO:
+        raise RuntimeError(f"Image is not in ISO format.")
+    logging.info("Image verified as ISO format.")
+
+def prepare_prep_disk(conn):
+    image_info = json.loads(subprocess.check_output(["qemu-img", "info", "--output", "json", sys.argv[1]]))
+    disks_service = conn.system_service().disks_service()
+    new_disk = disks_service.add(
+        disk = sdk.types.Disk(
+            name=os.path.basename(sys.argv[1]),
+            content_type=sdk.types.DiskContentType.ISO,
+            description="Uploaded Disk from Script",
+            format=sdk.types.DiskFormat.RAW,
+            initial_size=os.path.getsize(sys.argv[1]),
+            provisioned_size=image_info["virtual-size"],
+            sparse=False,
+            storage_domains=[sdk.types.StorageDomain(name="storage")]
+        )
+    )
+    return new_disk
+
+def prepare_transfer_service(conn, disk):
+    pass
+
+
+def get_auth():
+    # curl -o ca.pem -k https://architect.lab.cucyber.net/ovirt-engine/services/pki-resource?resource=ca-certificate&format=X509-PEM-CA 
+    domain_prefix = "lab.cucyber.net"
+    user = input(f"Username for user in domain [{domain_prefix}] ")
+    ovirt_username = user + "@" + domain_prefix
+
+    print(f"Authenticate for [{ovirt_username}]")
+    ovirt_password = getpass.getpass()
+
+    conn = sdk.Connection(
+        url='https://architect.lab.cucyber.net/ovirt-engine/api',
+        username=ovirt_username,
+        password=ovirt_password,
+        insecure=True
+    )
+    conn.test(raise_exception=True)
+    logging.info("Connection test successful.")
+    return conn
+
+
+def list_disks(conn, search=None):
+    disk_service = conn.system_service().disks_service()
+    disks = disk_service.list(search=search)
+    logging.info(f'Search for "{search if search else ""}" returned {len(disks)} disks')
+    for d in disks:
+        print(f"{d.name} ({convert_size(d.provisioned_size)})")
+    return disks
+
+
+def upload(conn, disk):
+    logging.info("Creating disk...")
+    disks_service = conn.system_service().disks_service()
+    disk_handle = disks_service.disk_service(disk.id)
+    while True:
+        time.sleep(5)
+        disk = disk_handle.get()
+        if disk.status == sdk.types.DiskStatus.OK:
+            break
+    logging.info("Disk created.")
+
+    logging.info("Creating transfer session...")
+    transfers_service = conn.system_service().image_transfers_service()
+    transfer = transfers_service.add(
+        sdk.types.ImageTransfer(
+            image=sdk.types.Image(id=disk.id)
+        )
+    )
+    transfer_handle = transfers_service.image_transfer_service(transfer.id)
+    while transfer.phase == sdk.types.ImageTransferPhase.INITIALIZING:
+        time.sleep(1)
+        transfer = transfer_handle.get()
+    logging.info("Transfer session created")
+
+    image_size = os.path.getsize(sys.argv[1])
+    image_path = sys.argv[1]
+
+    if transfer.transfer_url is not None:
+        dest_url = urlparse(transfer.transfer_url)
+    else:
+        logging.fatal("Direct upload not supported")
+        sys.exit(1)
+    
+    logging.debug("Creating SSL context")
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile='ca.pem')
+    
+    logging.debug("Creating HTTPS connection")
+    proxy_connection = HTTPSConnection(dest_url.hostname, dest_url.port, context=context)
+    proxy_connection.putrequest("PUT", dest_url.path)
+    proxy_connection.putheader('Content-Length', "%d" % (image_size,) )
+    proxy_connection.endheaders()
+    
+    logging.debug("Starting upload")
+    start = last_progress = time.time()
+
+    with open(image_path, "rb") as disk:
+        pos = 0
+        while pos < image_size:
+            # Send the next chunk to the proxy.
+            to_read = min(image_size - pos, BUF_SIZE)
+            chunk = disk.read(to_read)
+            if not chunk:
+                transfer_handle.pause()
+                raise RuntimeError("Unexpected end of file at pos=%d" % pos)
+
+            proxy_connection.send(chunk)
+            pos += len(chunk)
+            now = time.time()
+
+            # Report progress every 10 seconds.
+            if now - last_progress > 2:
+                print("Uploaded %.2f%%" % (float(pos) / image_size * 100), end="\r")
+                last_progress = now
+
+    # Get the response
+    response = proxy_connection.getresponse()
+    if response.status != 200:
+        transfer_handle.pause()
+        print(f"Upload failed: {response.status} {response.reason}")
+        sys.exit(1)
+
+    elapsed = time.time() - start
+
+    print("Uploaded %.2fg in %.2f seconds (%.2fm/s)" % (
+          image_size / float(1024**3), elapsed, image_size / 1024**2 / elapsed))
+
+    print("Finalizing transfer session...")
+
+    # This actually needs to be the transfer_handle
+    transfer_handle.finalize()
+    conn.close()
+    proxy_connection.close()
+
+
+
+def main():
+    storage_domain = "storage"
+    conn = get_auth()
+    current_disks = list_disks(conn, search=".iso")
+
+    if os.path.basename(sys.argv[1]) in (d.name for d in current_disks):
+        logging.fatal(f"ISO name {os.path.basename(sys.argv[1])} already exists.")
+        sys.exit(1)
+
+    prepare_verify_iso(sys.argv[1])
+    new_disk = prepare_prep_disk(conn)
+    upload(conn, new_disk)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(stream=sys.stdout, level=logging.DEBUG, format="[%(levelname)s] %(message)s")
+    main()
