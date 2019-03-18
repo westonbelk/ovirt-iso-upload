@@ -1,7 +1,7 @@
 # Todo
 
-* Argparse options
-* https
+* argparse options
+* secure https
 
 # OS Dependencies
 
