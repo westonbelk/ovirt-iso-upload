@@ -3,13 +3,26 @@
 * argparse options
 * secure https
 
-# OS Dependencies
+# Dependencies
 
-## Deps for Fedora/CentOS
+## General
+
+* Python 3
+* The `qemu-img` command is needed to get additional information about the iso.
+* [OVirt Python SDK](https://pypi.org/project/ovirt-engine-sdk-python/)
+
+## Fedora/CentOS
 
 ```
-?? maybe this is right?
-dnf install gcc libxml2-devel qemu-img
+dnf install gcc libxml2-devel python3-devel qemu-img
+# See requirements.txt for Python packages
+```
+
+## Ubuntu
+
+```
+apt install gcc libxml2-dev python3-dev qemu-utils
+# See requirements.txt for Python packages
 ```
 
 ## Notes
