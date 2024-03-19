@@ -1,10 +1,3 @@
-# Todo
-
-* argparse options
-* secure https
-
-# Dependencies
-
 ## General
 
 * Python 3
